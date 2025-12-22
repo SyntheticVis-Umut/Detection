@@ -1,0 +1,8 @@
+{
+  "detection_classes": "cat,person",
+  "resolution": { "width": 2028, "height": 1520 },
+  "web_preview": false,
+  "gui_preview": true,
+  "confidence_threshold": 0.5
+}
+

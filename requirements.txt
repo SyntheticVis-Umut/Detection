@@ -1,0 +1,13 @@
+# Hailo YOLO8 Detection App Requirements
+
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+flask>=2.0.0
+
+# Camera interface (usually installed via apt)
+# picamera2 - Install via: sudo apt-get install python3-picamera2
+
+# Hailo SDK (install separately)
+# hailo_platform - Install via Hailo SDK installation instructions
+
