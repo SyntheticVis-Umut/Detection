@@ -162,8 +162,8 @@ def image_to_rgb565(frame: np.ndarray) -> list:
     return pixel_data
 
 # HEF model paths (try H8L first, fallback to H8)
-HEF_PATH_H8L = "/usr/share/hailo-models/yolov8s_h8l.hef"
-HEF_PATH_H8 = "/usr/share/hailo-models/yolov8s_h8.hef"
+HEF_PATH_H8L = "/usr/share/hailo-models/yolov11n_h8l.hef"
+HEF_PATH_H8 = "/usr/share/hailo-models/yolov11n_h8.hef"
 
 # COCO class names (YOLO8 uses COCO dataset)
 COCO_CLASSES = [
