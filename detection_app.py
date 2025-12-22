@@ -15,6 +15,17 @@ import os
 from pathlib import Path
 from picamera2 import Picamera2
 from flask import Flask, Response, render_template_string
+import sys
+
+# Access Whisplay driver
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+DRIVER_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "Whisplay", "Driver"))
+if DRIVER_DIR not in sys.path:
+    sys.path.append(DRIVER_DIR)
+try:
+    from WhisPlay import WhisPlayBoard
+except Exception:
+    WhisPlayBoard = None
 
 # Hailo SDK imports
 try:
@@ -34,9 +45,14 @@ CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for detections
 WEB_PORT = 8080  # Web server port
 ENABLE_GUI = True  # Enable OpenCV GUI window (if available)
 ENABLE_WEB = True  # Enable web preview
+ENABLE_WHISPLAY = True  # Enable Whisplay display
 RESOLUTION_DEFAULT = (2028, 1520)  # Default camera resolution
 DETECTION_CLASSES = "all"  # "all" or comma-separated list e.g. "cat,dog"
 CONFIG_PATH = Path(__file__).parent / "config.json"
+
+# Whisplay constants
+WHISPLAY_WIDTH = 240
+WHISPLAY_HEIGHT = 280
 
 # GUI availability state
 GUI_AVAILABLE = False
@@ -51,7 +67,7 @@ allowed_classes_set = None  # set of lower-case class names when filtering
 
 def load_config():
     """Load configuration from config.json if present."""
-    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, RESOLUTION_DEFAULT, DETECTION_CLASSES, allowed_classes_set
+    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, allowed_classes_set
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r") as f:
@@ -65,6 +81,7 @@ def load_config():
     CONFIDENCE_THRESHOLD = float(cfg.get("confidence_threshold", CONFIDENCE_THRESHOLD))
     ENABLE_GUI = bool(cfg.get("gui_preview", ENABLE_GUI))
     ENABLE_WEB = bool(cfg.get("web_preview", ENABLE_WEB))
+    ENABLE_WHISPLAY = bool(cfg.get("whisplay_preview", ENABLE_WHISPLAY))
     DETECTION_CLASSES = cfg.get("detection_classes", DETECTION_CLASSES)
     
     # Resolution
@@ -120,6 +137,29 @@ def check_gui_available():
         print(f"⚠️  OpenCV GUI not available: {e}")
         print("   GUI will be disabled. Web interface will still work.")
         return False
+
+
+def image_to_rgb565(frame: np.ndarray) -> list:
+    """Convert OpenCV BGR frame to RGB565 byte list for Whisplay display."""
+    # Resize to fit Whisplay
+    resized = cv2.resize(frame, (WHISPLAY_WIDTH, WHISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
+    # Convert BGR to RGB
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    
+    # Efficient conversion to RGB565 using numpy
+    r = rgb[:, :, 0].astype(np.uint16)
+    g = rgb[:, :, 1].astype(np.uint16)
+    b = rgb[:, :, 2].astype(np.uint16)
+    
+    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    
+    # Convert to big-endian bytes
+    high_byte = (rgb565 >> 8).astype(np.uint8)
+    low_byte = (rgb565 & 0xFF).astype(np.uint8)
+    
+    # Stack and flatten
+    pixel_data = np.stack((high_byte, low_byte), axis=2).flatten().tolist()
+    return pixel_data
 
 # HEF model paths (try H8L first, fallback to H8)
 HEF_PATH_H8L = "/usr/share/hailo-models/yolov8s_h8l.hef"
@@ -608,15 +648,17 @@ def start_web_server():
     app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, debug=False)
 
 
-def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_gui: bool):
-    """Continuous video capture loop for smooth web streaming and optional GUI."""
+def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_gui: bool, board: WhisPlayBoard = None):
+    """Continuous video capture loop for smooth web streaming and optional GUI/Whisplay."""
     global latest_frame, latest_detections
     
     print("Starting video capture loop...")
     if enable_gui:
         print("✓ GUI window enabled")
-    else:
-        print("⚠️  GUI window disabled (web interface only)")
+    if board:
+        print("✓ Whisplay display enabled")
+    if not (enable_gui or board):
+        print("⚠️  Only web interface enabled")
     
     frame_count = 0
     fps_start_time = time.time()
@@ -676,6 +718,15 @@ def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_g
             with frame_lock:
                 latest_frame = frame_with_boxes
                 latest_detections = detections
+            
+            # Send to Whisplay display
+            if board is not None:
+                try:
+                    pixel_data = image_to_rgb565(frame_with_boxes)
+                    board.draw_image(0, 0, WHISPLAY_WIDTH, WHISPLAY_HEIGHT, pixel_data)
+                except Exception as e:
+                    print(f"✗ Whisplay display error: {e}")
+                    board = None  # Disable on error
             
             # GUI display and controls
             if enable_gui:
@@ -789,18 +840,30 @@ def main():
     # Decide GUI availability
     gui_available = check_gui_available() and ENABLE_GUI
     
+    # Initialize Whisplay
+    board = None
+    if ENABLE_WHISPLAY and WhisPlayBoard is not None:
+        try:
+            print("\nInitializing Whisplay display...")
+            board = WhisPlayBoard()
+            board.set_backlight(80)
+            print("✓ Whisplay display initialized!")
+        except Exception as e:
+            print(f"✗ Failed to initialize Whisplay: {e}")
+            board = None
+
     if gui_available:
         print("\n✓ GUI available - starting detection loop with GUI window...")
         print("Press 'q' in GUI window or Ctrl+C to stop")
         print("Press 's' in GUI window to save current frame")
         print("=" * 60)
         try:
-            video_capture_loop(picam2, detector, enable_gui=True)
+            video_capture_loop(picam2, detector, enable_gui=True, board=board)
         except KeyboardInterrupt:
             print("\n\nStopped by user.")
     else:
-        # Start video capture loop in a separate thread (web only)
-        video_thread = threading.Thread(target=video_capture_loop, args=(picam2, detector, False), daemon=True)
+        # Start video capture loop in a separate thread (web/whisplay)
+        video_thread = threading.Thread(target=video_capture_loop, args=(picam2, detector, False, board), daemon=True)
         video_thread.start()
         
         time.sleep(2)  # Give threads time to start
@@ -820,6 +883,8 @@ def main():
     try:
         picam2.stop()
         detector.cleanup()
+        if board:
+            board.cleanup()
     finally:
         print("Done.")
 
