@@ -4,6 +4,7 @@
   "web_preview": false,
   "gui_preview": true,
   "display_preview": false,
-  "confidence_threshold": 0.5
+  "confidence_threshold": 0.5,
+  "file_path": null
 }
 

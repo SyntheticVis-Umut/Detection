@@ -48,6 +48,7 @@ ENABLE_WEB = True  # Enable web preview
 ENABLE_WHISPLAY = True  # Enable Whisplay display
 RESOLUTION_DEFAULT = (2028, 1520)  # Default camera resolution
 DETECTION_CLASSES = "all"  # "all" or comma-separated list e.g. "cat,dog"
+FILE_PATH = None  # None for camera, or path to video file
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 # Whisplay constants
@@ -67,7 +68,7 @@ allowed_classes_set = None  # set of lower-case class names when filtering
 
 def load_config():
     """Load configuration from config.json if present."""
-    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, allowed_classes_set
+    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, allowed_classes_set
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r") as f:
@@ -84,6 +85,16 @@ def load_config():
     # Support both 'display_preview' (new) and 'whisplay_preview' (legacy) for backward compatibility
     ENABLE_WHISPLAY = bool(cfg.get("display_preview", cfg.get("whisplay_preview", ENABLE_WHISPLAY)))
     DETECTION_CLASSES = cfg.get("detection_classes", DETECTION_CLASSES)
+    
+    # File path for video input (null/None means camera)
+    raw_file_path = cfg.get("file_path", None)
+    if raw_file_path is None or (isinstance(raw_file_path, str) and raw_file_path.strip().lower() == "null"):
+        FILE_PATH = None
+    else:
+        FILE_PATH = str(raw_file_path).strip()
+        # Resolve relative paths
+        if FILE_PATH and not Path(FILE_PATH).is_absolute():
+            FILE_PATH = str(Path(__file__).parent / FILE_PATH)
     
     # Resolution
     res_cfg = cfg.get("resolution", {})
@@ -666,8 +677,16 @@ def start_web_server():
     app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, debug=False)
 
 
-def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_gui: bool, board: WhisPlayBoard = None):
-    """Continuous video capture loop for smooth web streaming and optional GUI/Whisplay."""
+def video_capture_loop(picam2, cap, detector: HailoYOLO8Detector, enable_gui: bool, board: WhisPlayBoard = None):
+    """Continuous video capture loop for smooth web streaming and optional GUI/Whisplay.
+    
+    Args:
+        picam2: Picamera2 instance (for camera input) or None
+        cap: cv2.VideoCapture instance (for video file input) or None
+        detector: HailoYOLO8Detector instance
+        enable_gui: Whether to show GUI window
+        board: WhisPlayBoard instance or None
+    """
     global latest_frame, latest_detections
     
     print("\nStarting video capture loop...")
@@ -687,20 +706,29 @@ def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_g
     fps_start_time = time.time()
     fps = 0.0
     resolution_logged = False
+    using_video_file = cap is not None
     
-    window_name = "Hailo YOLO8 Detection"
+    window_name = "Hailo YOLO Detection"
     if enable_gui:
         try:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window_name, 2028 , 1520)
+            cv2.resizeWindow(window_name, 1280, 720)
         except Exception as e:
             print(f"✗ Failed to create GUI window: {e}")
             enable_gui = False
     
     while True:
         try:
-            # Capture frame
-            frame = picam2.capture_array("main")
+            # Capture frame from either camera or video file
+            if using_video_file:
+                ret, frame = cap.read()
+                if not ret:
+                    print("\n✓ End of video file reached. Looping...")
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Loop video
+                    continue
+                # OpenCV reads in BGR format, keep as-is
+            else:
+                frame = picam2.capture_array("main")
             
             # Run inference
             detections = detector.infer(frame)
@@ -789,11 +817,13 @@ def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_g
 
 def main():
     """Main application loop."""
+    global RESOLUTION_DEFAULT
     load_config()
     
     print("=" * 60)
     print("Hailo YOLO Object Detection App (YOLOv8/YOLOv11)")
     print("=" * 60)
+    print(f"Input source: {'Video file: ' + FILE_PATH if FILE_PATH else 'Camera'}")
     print(f"Confidence threshold: {CONFIDENCE_THRESHOLD}")
     print(f"Resolution: {RESOLUTION_DEFAULT[0]}x{RESOLUTION_DEFAULT[1]}")
     print(f"Web preview: {'Enabled' if ENABLE_WEB else 'Disabled'}")
@@ -837,29 +867,67 @@ def main():
         traceback.print_exc()
         return
     
-    # Initialize camera
-    print("\n📷 Initializing Raspberry Pi camera...")
-    try:
-        picam2 = Picamera2()
-        
-        # Configure camera for video capture
-        config = picam2.create_video_configuration(
-            main={"size": (RESOLUTION_DEFAULT[0], RESOLUTION_DEFAULT[1]), "format": "RGB888"},
-            buffer_count=2
-        )
-        picam2.configure(config)
-        picam2.start()
-        
-        # Allow camera to stabilize
-        time.sleep(2)
-        print("✓ Camera ready!")
-        
-    except Exception as e:
-        print(f"\n✗ ERROR initializing camera: {e}")
-        detector.cleanup()
-        import traceback
-        traceback.print_exc()
-        return
+    # Initialize input source (camera or video file)
+    picam2 = None
+    cap = None
+    
+    if FILE_PATH:
+        # Video file input
+        print(f"\n📹 Opening video file: {FILE_PATH}")
+        try:
+            if not Path(FILE_PATH).exists():
+                print(f"\n✗ ERROR: Video file not found: {FILE_PATH}")
+                detector.cleanup()
+                return
+            
+            cap = cv2.VideoCapture(FILE_PATH)
+            if not cap.isOpened():
+                print(f"\n✗ ERROR: Could not open video file: {FILE_PATH}")
+                detector.cleanup()
+                return
+            
+            # Get video resolution and override config resolution
+            video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            video_fps = cap.get(cv2.CAP_PROP_FPS)
+            
+            RESOLUTION_DEFAULT = (video_width, video_height)
+            
+            print(f"✓ Video file opened successfully")
+            print(f"   Resolution: {video_width}x{video_height}")
+            print(f"   FPS: {video_fps:.1f}")
+            print(f"   Config resolution overridden to match video")
+            
+        except Exception as e:
+            print(f"\n✗ ERROR opening video file: {e}")
+            detector.cleanup()
+            import traceback
+            traceback.print_exc()
+            return
+    else:
+        # Camera input
+        print("\n📷 Initializing Raspberry Pi camera...")
+        try:
+            picam2 = Picamera2()
+            
+            # Configure camera for video capture
+            config = picam2.create_video_configuration(
+                main={"size": (RESOLUTION_DEFAULT[0], RESOLUTION_DEFAULT[1]), "format": "RGB888"},
+                buffer_count=2
+            )
+            picam2.configure(config)
+            picam2.start()
+            
+            # Allow camera to stabilize
+            time.sleep(2)
+            print("✓ Camera ready!")
+            
+        except Exception as e:
+            print(f"\n✗ ERROR initializing camera: {e}")
+            detector.cleanup()
+            import traceback
+            traceback.print_exc()
+            return
     
     # Start web server in a separate thread (if enabled)
     if ENABLE_WEB:
@@ -887,12 +955,12 @@ def main():
         print("Press 's' in GUI window to save current frame")
         print("=" * 60)
         try:
-            video_capture_loop(picam2, detector, enable_gui=True, board=board)
+            video_capture_loop(picam2, cap, detector, enable_gui=True, board=board)
         except KeyboardInterrupt:
             print("\n\nStopped by user.")
     else:
         # Start video capture loop in a separate thread (web/whisplay)
-        video_thread = threading.Thread(target=video_capture_loop, args=(picam2, detector, False, board), daemon=True)
+        video_thread = threading.Thread(target=video_capture_loop, args=(picam2, cap, detector, False, board), daemon=True)
         video_thread.start()
         
         time.sleep(2)  # Give threads time to start
@@ -910,7 +978,10 @@ def main():
     # Cleanup
     print("\nCleaning up...")
     try:
-        picam2.stop()
+        if picam2:
+            picam2.stop()
+        if cap:
+            cap.release()
         detector.cleanup()
         if board:
             board.cleanup()
