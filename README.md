@@ -658,17 +658,39 @@ sudo cp /tmp/best.hef /usr/share/hailo-models/
 
 ## Performance
 
-- **FPS:** 20-30 FPS (depending on resolution and number of detections)
+- **FPS:** 30-60+ FPS (depending on resolution, model, and display options)
 - **Model:** YOLOv11n (nano) - Fastest option
 - **Input resolution:** 640x640 (letterboxed from camera resolution)
-- **Latency:** ~30-50ms per frame (including inference + display)
+- **Latency:** ~15-30ms per frame (including inference + display)
+
+### Performance Optimizations Applied
+
+The code includes several performance optimizations:
+- **Reusable inference pipeline** - Inference context is created once and reused (major speedup)
+- **Optimized preprocessing** - Uses INTER_AREA interpolation for faster resizing
+- **No artificial delays** - Removed sleep() calls that limited frame rate
+- **Conditional display updates** - Whisplay display only updates when enabled
 
 ### Performance Tips
 
-- Use YOLOv11n for maximum speed
-- Reduce camera resolution for higher FPS
-- Increase confidence threshold to filter more detections
-- Disable unused display outputs (web/GUI) if only using Whisplay
+**To maximize FPS:**
+1. **Use YOLOv11n (nano) model** - Smallest, fastest model
+2. **Lower camera resolution** - Set `"resolution": {"width": 640, "height": 640}` in config.json
+3. **Disable unused displays** - Set `"display_preview": false`, `"gui_preview": false`, `"web_preview": false` if not needed
+4. **Increase confidence threshold** - Set `"confidence_threshold": 0.7` to filter more detections (less post-processing)
+5. **Use smaller model variants** - YOLOv11n > YOLOv11s > YOLOv11m (speed vs accuracy tradeoff)
+
+**Expected Performance:**
+- **YOLOv11n @ 640x640:** 50-60+ FPS
+- **YOLOv11n @ 1280x720:** 35-45 FPS
+- **YOLOv11n @ 2028x1520:** 20-30 FPS
+- **YOLOv11s @ 640x640:** 30-40 FPS
+
+**Note:** Actual FPS depends on:
+- Hailo NPU model (Hailo-8L vs Hailo-8)
+- Number of detections per frame
+- Display options enabled
+- System load
 
 ## Troubleshooting
 

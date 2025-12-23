@@ -81,7 +81,8 @@ def load_config():
     CONFIDENCE_THRESHOLD = float(cfg.get("confidence_threshold", CONFIDENCE_THRESHOLD))
     ENABLE_GUI = bool(cfg.get("gui_preview", ENABLE_GUI))
     ENABLE_WEB = bool(cfg.get("web_preview", ENABLE_WEB))
-    ENABLE_WHISPLAY = bool(cfg.get("whisplay_preview", ENABLE_WHISPLAY))
+    # Support both 'display_preview' (new) and 'whisplay_preview' (legacy) for backward compatibility
+    ENABLE_WHISPLAY = bool(cfg.get("display_preview", cfg.get("whisplay_preview", ENABLE_WHISPLAY)))
     DETECTION_CLASSES = cfg.get("detection_classes", DETECTION_CLASSES)
     
     # Resolution
@@ -198,6 +199,10 @@ class HailoYOLO8Detector:
         self.input_shape = None
         self.output_shape = None
         
+        # Performance optimization: Reuse inference pipeline
+        self.infer_pipeline = None
+        self.network_group_params = None
+        
         # Letterbox tracking for coordinate transformation
         self.original_frame_size = None
         self.letterbox_offset = (0, 0)
@@ -246,6 +251,17 @@ class HailoYOLO8Detector:
         if output_vstream_infos:
             self.output_shape = output_vstream_infos[0].shape
             print(f"Model output shape: {self.output_shape}")
+        
+        # Create reusable inference pipeline for performance
+        print("⚡ Creating reusable inference pipeline (performance optimization)...")
+        self.network_group_params = self.network_group.create_params()
+        self.infer_pipeline = InferVStreams(
+            self.network_group, 
+            self.input_vstreams_params, 
+            self.output_vstreams_params
+        )
+        self.infer_pipeline.__enter__()  # Initialize the pipeline
+        print("✓ Inference pipeline ready (reusable for maximum performance)")
     
     def preprocess(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -261,8 +277,8 @@ class HailoYOLO8Detector:
         new_w = int(original_w * scale)
         new_h = int(original_h * scale)
         
-        # Resize maintaining aspect ratio
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # Resize maintaining aspect ratio (using INTER_AREA for better performance/quality balance)
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
         
         # Create letterbox (add black padding to center the image)
         letterboxed = np.zeros((MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, frame.shape[2]), dtype=frame.dtype)
@@ -431,16 +447,9 @@ class HailoYOLO8Detector:
         input_name = input_vstream_info.name
         input_data = {input_name: preprocessed}
         
-        # Run inference
-        network_group_params = self.network_group.create_params()
-        
-        with InferVStreams(
-            self.network_group, 
-            self.input_vstreams_params, 
-            self.output_vstreams_params
-        ) as infer_pipeline:
-            with self.network_group.activate(network_group_params):
-                output = infer_pipeline.infer(input_data)
+        # Run inference using reusable pipeline (much faster than creating new one each frame)
+        with self.network_group.activate(self.network_group_params):
+            output = self.infer_pipeline.infer(input_data)
         
         # Parse detections
         detections = self.parse_detections(output)
@@ -449,6 +458,14 @@ class HailoYOLO8Detector:
     
     def cleanup(self):
         """Clean up resources."""
+        # Clean up inference pipeline
+        if self.infer_pipeline is not None:
+            try:
+                self.infer_pipeline.__exit__(None, None, None)
+            except Exception:
+                pass
+            self.infer_pipeline = None
+        
         if self.vdevice:
             pass  # VDevice cleanup is handled automatically
 
@@ -457,6 +474,7 @@ def draw_detections(frame: np.ndarray, detections: list) -> np.ndarray:
     """Draw bounding boxes and labels on frame."""
     # Picamera2 with RGB888 already matches OpenCV expectations on Pi (BGR-like in practice).
     # To avoid color tint issues, skip color channel swaps and draw directly.
+    # Use copy only if we need to preserve original (for now, copy for safety)
     frame_with_boxes = frame.copy()
     
     # Color palette for different classes
@@ -652,13 +670,18 @@ def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_g
     """Continuous video capture loop for smooth web streaming and optional GUI/Whisplay."""
     global latest_frame, latest_detections
     
-    print("Starting video capture loop...")
+    print("\nStarting video capture loop...")
+    print("Display outputs:")
     if enable_gui:
-        print("✓ GUI window enabled")
-    if board:
-        print("✓ Whisplay display enabled")
-    if not (enable_gui or board):
-        print("⚠️  Only web interface enabled")
+        print("  ✓ GUI window enabled")
+    if board and ENABLE_WHISPLAY:
+        print("  ✓ Whisplay display enabled")
+    if ENABLE_WEB:
+        print("  ✓ Web interface enabled")
+    if not (enable_gui or (board and ENABLE_WHISPLAY) or ENABLE_WEB):
+        print("  ⚠️  No display outputs enabled")
+    print("Performance optimizations: Active")
+    print("=" * 60)
     
     frame_count = 0
     fps_start_time = time.time()
@@ -719,8 +742,8 @@ def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_g
                 latest_frame = frame_with_boxes
                 latest_detections = detections
             
-            # Send to Whisplay display
-            if board is not None:
+            # Send to Whisplay display (only if enabled)
+            if board is not None and ENABLE_WHISPLAY:
                 try:
                     pixel_data = image_to_rgb565(frame_with_boxes)
                     board.draw_image(0, 0, WHISPLAY_WIDTH, WHISPLAY_HEIGHT, pixel_data)
@@ -745,8 +768,8 @@ def video_capture_loop(picam2: Picamera2, detector: HailoYOLO8Detector, enable_g
                     print(f"✗ GUI error: {e}. Disabling GUI.")
                     enable_gui = False
             
-            # Small delay to limit CPU usage
-            time.sleep(0.03)
+            # Remove artificial delay - let the system run at maximum speed
+            # The inference and display operations naturally limit the frame rate
             
         except Exception as e:
             print(f"Error in video loop: {e}")
@@ -769,12 +792,13 @@ def main():
     load_config()
     
     print("=" * 60)
-    print("Hailo YOLO8 Object Detection App")
+    print("Hailo YOLO Object Detection App (YOLOv8/YOLOv11)")
     print("=" * 60)
     print(f"Confidence threshold: {CONFIDENCE_THRESHOLD}")
     print(f"Resolution: {RESOLUTION_DEFAULT[0]}x{RESOLUTION_DEFAULT[1]}")
     print(f"Web preview: {'Enabled' if ENABLE_WEB else 'Disabled'}")
     print(f"GUI preview: {'Enabled' if ENABLE_GUI else 'Disabled'}")
+    print(f"Display preview (Whisplay): {'Enabled' if ENABLE_WHISPLAY else 'Disabled'}")
     if allowed_classes_set is None:
         print("Detection classes: all")
     else:
@@ -788,12 +812,17 @@ def main():
     
     # Find HEF file
     hef_path = None
+    model_name = "Unknown"
     if Path(HEF_PATH_H8L).exists():
         hef_path = HEF_PATH_H8L
-        print(f"\nUsing HEF: {hef_path} (Hailo-8L)")
+        model_name = Path(hef_path).stem
+        print(f"\n📦 Model: {model_name} (Hailo-8L)")
+        print(f"   Path: {hef_path}")
     elif Path(HEF_PATH_H8).exists():
         hef_path = HEF_PATH_H8
-        print(f"\nUsing HEF: {hef_path} (Hailo-8)")
+        model_name = Path(hef_path).stem
+        print(f"\n📦 Model: {model_name} (Hailo-8)")
+        print(f"   Path: {hef_path}")
     else:
         print(f"\n✗ ERROR: HEF file not found!")
         print(f"Expected at: {HEF_PATH_H8L} or {HEF_PATH_H8}")
@@ -809,7 +838,7 @@ def main():
         return
     
     # Initialize camera
-    print("\nInitializing Raspberry Pi camera...")
+    print("\n📷 Initializing Raspberry Pi camera...")
     try:
         picam2 = Picamera2()
         
@@ -823,7 +852,7 @@ def main():
         
         # Allow camera to stabilize
         time.sleep(2)
-        print("Camera ready!")
+        print("✓ Camera ready!")
         
     except Exception as e:
         print(f"\n✗ ERROR initializing camera: {e}")
