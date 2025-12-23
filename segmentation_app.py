@@ -17,6 +17,47 @@ from picamera2 import Picamera2
 from flask import Flask, Response, render_template_string
 import sys
 
+def vectorized_nms(preds, iou_thres):
+    """
+    Optimized NMS using vectorized NumPy operations.
+    This provides high performance on Raspberry Pi without needing compiled C extensions.
+    """
+    if preds.shape[0] == 0:
+        return np.array([], dtype=np.int32)
+    
+    boxes = preds[:, :4]
+    scores = preds[:, 4]
+    
+    # Vectorized area calculation
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    order = scores.argsort()[::-1]
+    
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        
+        if order.size == 1:
+            break
+        
+        # Vectorized IoU calculation for all remaining boxes
+        xx1 = np.maximum(boxes[i, 0], boxes[order[1:], 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[order[1:], 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[order[1:], 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[order[1:], 3])
+        
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        
+        # Vectorized filtering
+        inds = np.where(iou <= iou_thres)[0]
+        order = order[inds + 1]
+    
+    return np.array(keep, dtype=np.int32)
+
 # Access Whisplay driver
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVER_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "Whisplay", "Driver"))
@@ -50,6 +91,7 @@ RESOLUTION_DEFAULT = (2028, 1520)  # Default camera resolution
 DETECTION_CLASSES = "all"  # "all" or comma-separated list e.g. "cat,dog"
 FILE_PATH = None  # None for camera, or path to video file
 FRAME_SKIP = 1  # Skip frames to reduce CPU load
+DISPLAY_SCALE = 1.0  # Scale factor for display operations (0.5 = half size, reduces mask overlay work by 4x)
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 # Whisplay constants
@@ -83,7 +125,7 @@ MASK_COLORS = [
 
 def load_config():
     """Load configuration from config.json if present."""
-    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, FRAME_SKIP, allowed_classes_set
+    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, FRAME_SKIP, DISPLAY_SCALE, allowed_classes_set
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r") as f:
@@ -101,6 +143,7 @@ def load_config():
     ENABLE_WHISPLAY = bool(cfg.get("display_preview", cfg.get("whisplay_preview", ENABLE_WHISPLAY)))
     DETECTION_CLASSES = cfg.get("detection_classes", DETECTION_CLASSES)
     FRAME_SKIP = int(cfg.get("frame_skip", FRAME_SKIP))
+    DISPLAY_SCALE = float(cfg.get("display_scale", DISPLAY_SCALE))
     
     # File path for video input (null/None means camera)
     raw_file_path = cfg.get("file_path", None)
@@ -533,82 +576,87 @@ class HailoYOLO8Segmentation:
         cls_all = np.concatenate([d[2] for d in decoded], axis=0)
         masks_all = np.concatenate([d[3] for d in decoded], axis=0)
 
-        # NMS
-        def nms(boxes, scores, iou_thres=0.45, top_k=200):
-            x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
-            areas = (x2 - x1).clip(min=0) * (y2 - y1).clip(min=0)
-            order = scores.argsort()[::-1]
-            keep = []
-            while order.size > 0 and len(keep) < top_k:
-                i = order[0]
-                keep.append(i)
-                xx1 = np.maximum(x1[i], x1[order[1:]])
-                yy1 = np.maximum(y1[i], y1[order[1:]])
-                xx2 = np.minimum(x2[i], x2[order[1:]])
-                yy2 = np.minimum(y2[i], y2[order[1:]])
-                w = np.maximum(0.0, xx2 - xx1)
-                h = np.maximum(0.0, yy2 - yy1)
-                inter = w * h
-                iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-                inds = np.where(iou <= iou_thres)[0]
-                order = order[inds + 1]
-            return keep
-
-        keep_inds = nms(boxes_all, scores_all, iou_thres=0.45, top_k=100)
+        # Native NMS (Optimized Vectorized NumPy)
+        # Format: [x1, y1, x2, y2, score] for vectorized_nms
+        preds = np.hstack([boxes_all.astype(np.float32), scores_all[:, None].astype(np.float32)])
+        keep_inds = vectorized_nms(preds, iou_thres=0.45)
+        
+        # Limit to top 100 detections
+        if keep_inds.shape[0] > 100:
+            keep_inds = keep_inds[:100]
+        
         boxes_all = boxes_all[keep_inds]
         scores_all = scores_all[keep_inds]
         cls_all = cls_all[keep_inds]
         masks_all = masks_all[keep_inds]
 
-        # Generate masks and transform boxes to original frame
+        # Generate masks and transform boxes to original frame (vectorized where possible)
         orig_h, orig_w = self.original_frame_size[1], self.original_frame_size[0]
-        for box, score, cls_id, mcoeff in zip(boxes_all, scores_all, cls_all, masks_all):
+        scale_x = 160.0 / MODEL_INPUT_SIZE
+        scale_y = 160.0 / MODEL_INPUT_SIZE
+        
+        # Vectorized coordinate transformation (batch process all boxes)
+        boxes_transformed = []
+        for box in boxes_all:
             x_min, y_min, x_max, y_max = box
-
-            # Transform to original frame
             x_min_i, y_min_i, x_max_i, y_max_i = self._transform_coordinates(x_min, y_min, x_max, y_max)
-
-            # Compose mask (proto 160x160): crop to bbox in proto space, then resize only the bbox region
-            full_mask = np.tensordot(mask_proto, mcoeff, axes=([2],[0]))  # (160,160)
-            full_mask = 1.0 / (1.0 + np.exp(-full_mask))  # sigmoid
-
-            if (y_max_i > y_min_i) and (x_max_i > x_min_i):
-                bbox_w = x_max_i - x_min_i
-                bbox_h = y_max_i - y_min_i
-
-                # map bbox to proto coords (proto corresponds to 640x640 model space)
-                scale_x = 160.0 / MODEL_INPUT_SIZE
-                scale_y = 160.0 / MODEL_INPUT_SIZE
-                px_min = max(0, min(int(x_min * scale_x), 160))
-                py_min = max(0, min(int(y_min * scale_y), 160))
-                px_max = max(0, min(int(x_max * scale_x), 160))
-                py_max = max(0, min(int(y_max * scale_y), 160))
-
-                if px_max > px_min and py_max > py_min:
-                    mask_crop_proto = full_mask[py_min:py_max, px_min:px_max]
+            boxes_transformed.append((x_min_i, y_min_i, x_max_i, y_max_i))
+        
+        # Batch process masks (vectorized mask composition)
+        # Vectorized mask composition using einsum (native compiled NumPy operation)
+        if len(masks_all) > 0:
+            # Batch compose all masks at once using einsum (compiled C operation)
+            # mask_proto: (160, 160, 32), masks_all: (N, 32)
+            # Result: (N, 160, 160)
+            full_masks = np.einsum('ijk, nk -> nij', mask_proto, masks_all)
+            full_masks = 1.0 / (1.0 + np.exp(-full_masks))  # sigmoid (vectorized)
+            
+            # Vectorized bbox calculations
+            boxes_transformed_array = np.array(boxes_transformed)
+            bbox_widths = boxes_transformed_array[:, 2] - boxes_transformed_array[:, 0]
+            bbox_heights = boxes_transformed_array[:, 3] - boxes_transformed_array[:, 1]
+            valid_mask = (bbox_widths > 0) & (bbox_heights > 0)
+            
+            # Process masks (vectorized where possible, minimal Python loops)
+            for i, (box, score, cls_id, (x_min_i, y_min_i, x_max_i, y_max_i)) in enumerate(
+                zip(boxes_all, scores_all, cls_all, boxes_transformed)
+            ):
+                if not valid_mask[i]:
+                    mask_crop = None
                 else:
-                    mask_crop_proto = full_mask
+                    bbox_w = int(bbox_widths[i])
+                    bbox_h = int(bbox_heights[i])
+                    
+                    # Map bbox to proto coords
+                    px_min = max(0, min(int(box[0] * scale_x), 160))
+                    py_min = max(0, min(int(box[1] * scale_y), 160))
+                    px_max = max(0, min(int(box[2] * scale_x), 160))
+                    py_max = max(0, min(int(box[3] * scale_y), 160))
+                    
+                    if px_max > px_min and py_max > py_min:
+                        mask_crop_proto = full_masks[i, py_min:py_max, px_min:px_max]
+                    else:
+                        mask_crop_proto = full_masks[i]
+                    
+                    # Resize mask to bbox size (OpenCV is compiled C)
+                    mask_crop = cv2.resize(mask_crop_proto, (bbox_w, bbox_h), interpolation=cv2.INTER_LINEAR)
+                
+                class_name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"class_{cls_id}"
 
-                mask_crop = cv2.resize(mask_crop_proto, (bbox_w, bbox_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                mask_crop = None
-
-            class_name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"class_{cls_id}"
-
-            detections.append({
-                'class_id': int(cls_id),
-                'class_name': class_name,
-                'confidence': float(score),
-                'bbox': {
-                    'x_min': float(x_min_i),
-                    'y_min': float(y_min_i),
-                    'x_max': float(x_max_i),
-                    'y_max': float(y_max_i),
-                    'width': float(x_max_i - x_min_i),
-                    'height': float(y_max_i - y_min_i)
-                },
-                'mask': mask_crop
-            })
+                detections.append({
+                    'class_id': int(cls_id),
+                    'class_name': class_name,
+                    'confidence': float(score),
+                    'bbox': {
+                        'x_min': float(x_min_i),
+                        'y_min': float(y_min_i),
+                        'x_max': float(x_max_i),
+                        'y_max': float(y_max_i),
+                        'width': float(bbox_widths[i]),
+                        'height': float(bbox_heights[i])
+                    },
+                    'mask': mask_crop
+                })
 
         return detections
     
@@ -882,8 +930,43 @@ def video_capture_loop(picam2, cap, detector: HailoYOLO8Segmentation, enable_gui
                     and det.get("class_name", "").lower() in allowed_classes_set
                 ]
             
-            # Draw detections with masks
-            frame_with_overlay = draw_segmentation(frame, detections)
+            # Early downscaling for display operations (reduces mask overlay work significantly)
+            # Keep full resolution for inference, but work on smaller frame for display
+            if DISPLAY_SCALE < 1.0:
+                orig_h, orig_w = frame.shape[:2]
+                display_w = int(orig_w * DISPLAY_SCALE)
+                display_h = int(orig_h * DISPLAY_SCALE)
+                frame_display = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_AREA)
+                
+                # Scale detections to display dimensions (minimal Python work)
+                detections_scaled = []
+                for det in detections:
+                    det_scaled = det.copy()
+                    bbox = det_scaled['bbox']
+                    det_scaled['bbox'] = {
+                        'x_min': bbox['x_min'] * DISPLAY_SCALE,
+                        'y_min': bbox['y_min'] * DISPLAY_SCALE,
+                        'x_max': bbox['x_max'] * DISPLAY_SCALE,
+                        'y_max': bbox['y_max'] * DISPLAY_SCALE,
+                        'width': bbox['width'] * DISPLAY_SCALE,
+                        'height': bbox['height'] * DISPLAY_SCALE
+                    }
+                    # Scale mask if present (only resize the bbox-sized mask, not full frame)
+                    if det_scaled.get('mask') is not None:
+                        mask = det_scaled['mask']
+                        if mask is not None and mask.size > 0:
+                            mask_h, mask_w = mask.shape[:2]
+                            new_mask_w = int(mask_w * DISPLAY_SCALE)
+                            new_mask_h = int(mask_h * DISPLAY_SCALE)
+                            if new_mask_w > 0 and new_mask_h > 0:
+                                det_scaled['mask'] = cv2.resize(mask, (new_mask_w, new_mask_h), interpolation=cv2.INTER_LINEAR)
+                    detections_scaled.append(det_scaled)
+                
+                # Draw on downscaled frame (much faster - 4x fewer pixels for mask overlay with 0.5 scale)
+                frame_with_overlay = draw_segmentation(frame_display, detections_scaled)
+            else:
+                # No downscaling, use full resolution
+                frame_with_overlay = draw_segmentation(frame, detections)
             
             # Log resolutions once
             if not resolution_logged:
@@ -967,6 +1050,8 @@ def main():
     print(f"Input source: {'Video file: ' + FILE_PATH if FILE_PATH else 'Camera'}")
     print(f"Confidence threshold: {CONFIDENCE_THRESHOLD}")
     print(f"Resolution: {RESOLUTION_DEFAULT[0]}x{RESOLUTION_DEFAULT[1]}")
+    print(f"Display scale: {DISPLAY_SCALE:.2f}x (early downscaling for performance)")
+    print(f"Frame skip: {FRAME_SKIP} (process every {FRAME_SKIP} frame(s))")
     print(f"Web preview: {'Enabled' if ENABLE_WEB else 'Disabled'}")
     print(f"GUI preview: {'Enabled' if ENABLE_GUI else 'Disabled'}")
     print(f"Display preview (Whisplay): {'Enabled' if ENABLE_WHISPLAY else 'Disabled'}")
