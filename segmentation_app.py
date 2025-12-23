@@ -49,6 +49,7 @@ ENABLE_WHISPLAY = True  # Enable Whisplay display
 RESOLUTION_DEFAULT = (2028, 1520)  # Default camera resolution
 DETECTION_CLASSES = "all"  # "all" or comma-separated list e.g. "cat,dog"
 FILE_PATH = None  # None for camera, or path to video file
+FRAME_SKIP = 1  # Skip frames to reduce CPU load
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 # Whisplay constants
@@ -82,7 +83,7 @@ MASK_COLORS = [
 
 def load_config():
     """Load configuration from config.json if present."""
-    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, allowed_classes_set
+    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, FRAME_SKIP, allowed_classes_set
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r") as f:
@@ -99,6 +100,7 @@ def load_config():
     # Support both 'display_preview' (new) and 'whisplay_preview' (legacy) for backward compatibility
     ENABLE_WHISPLAY = bool(cfg.get("display_preview", cfg.get("whisplay_preview", ENABLE_WHISPLAY)))
     DETECTION_CLASSES = cfg.get("detection_classes", DETECTION_CLASSES)
+    FRAME_SKIP = int(cfg.get("frame_skip", FRAME_SKIP))
     
     # File path for video input (null/None means camera)
     raw_file_path = cfg.get("file_path", None)
@@ -566,13 +568,30 @@ class HailoYOLO8Segmentation:
             # Transform to original frame
             x_min_i, y_min_i, x_max_i, y_max_i = self._transform_coordinates(x_min, y_min, x_max, y_max)
 
-            # Compose mask
+            # Compose mask (proto 160x160): crop to bbox in proto space, then resize only the bbox region
             full_mask = np.tensordot(mask_proto, mcoeff, axes=([2],[0]))  # (160,160)
             full_mask = 1.0 / (1.0 + np.exp(-full_mask))  # sigmoid
-            # Resize to original frame
-            mask_resized = cv2.resize(full_mask, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-            # Crop to bbox
-            mask_crop = mask_resized[y_min_i:y_max_i, x_min_i:x_max_i] if (y_max_i>y_min_i and x_max_i>x_min_i) else None
+
+            if (y_max_i > y_min_i) and (x_max_i > x_min_i):
+                bbox_w = x_max_i - x_min_i
+                bbox_h = y_max_i - y_min_i
+
+                # map bbox to proto coords (proto corresponds to 640x640 model space)
+                scale_x = 160.0 / MODEL_INPUT_SIZE
+                scale_y = 160.0 / MODEL_INPUT_SIZE
+                px_min = max(0, min(int(x_min * scale_x), 160))
+                py_min = max(0, min(int(y_min * scale_y), 160))
+                px_max = max(0, min(int(x_max * scale_x), 160))
+                py_max = max(0, min(int(y_max * scale_y), 160))
+
+                if px_max > px_min and py_max > py_min:
+                    mask_crop_proto = full_mask[py_min:py_max, px_min:px_max]
+                else:
+                    mask_crop_proto = full_mask
+
+                mask_crop = cv2.resize(mask_crop_proto, (bbox_w, bbox_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                mask_crop = None
 
             class_name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"class_{cls_id}"
 
@@ -847,6 +866,10 @@ def video_capture_loop(picam2, cap, detector: HailoYOLO8Segmentation, enable_gui
                 # OpenCV reads in BGR format, keep as-is
             else:
                 frame = picam2.capture_array("main")
+
+            frame_count += 1
+            if FRAME_SKIP > 1 and (frame_count % FRAME_SKIP != 0):
+                continue
             
             # Run inference
             detections = detector.infer(frame)

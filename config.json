@@ -1,10 +1,11 @@
 {
   "detection_classes": "cat,person",
-  "resolution": { "width": 2028, "height": 1520 },
+  "resolution": { "width": 640, "height": 360 },
   "web_preview": false,
   "gui_preview": true,
   "display_preview": false,
   "confidence_threshold": 0.5,
-  "file_path": "resources/example.mp4"
+  "file_path": "resources/example.mp4",
+  "frame_skip": 2
 }
 
