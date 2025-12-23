@@ -5,6 +5,6 @@
   "gui_preview": true,
   "display_preview": false,
   "confidence_threshold": 0.5,
-  "file_path": null
+  "file_path": "resources/example.mp4"
 }
 
