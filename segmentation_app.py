@@ -92,6 +92,7 @@ DETECTION_CLASSES = "all"  # "all" or comma-separated list e.g. "cat,dog"
 FILE_PATH = None  # None for camera, or path to video file
 FRAME_SKIP = 1  # Skip frames to reduce CPU load
 DISPLAY_SCALE = 1.0  # Scale factor for display operations (0.5 = half size, reduces mask overlay work by 4x)
+SHOW_BOXES_ONLY = False  # If True, show only cropped bounding boxes instead of full frame
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 # Whisplay constants
@@ -125,7 +126,7 @@ MASK_COLORS = [
 
 def load_config():
     """Load configuration from config.json if present."""
-    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, FRAME_SKIP, DISPLAY_SCALE, allowed_classes_set
+    global CONFIDENCE_THRESHOLD, ENABLE_GUI, ENABLE_WEB, ENABLE_WHISPLAY, RESOLUTION_DEFAULT, DETECTION_CLASSES, FILE_PATH, FRAME_SKIP, DISPLAY_SCALE, allowed_classes_set, SHOW_BOXES_ONLY
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r") as f:
@@ -173,6 +174,9 @@ def load_config():
     else:
         allowed_classes_set = None
         DETECTION_CLASSES = "all"
+    
+    # Box-only preview mode
+    SHOW_BOXES_ONLY = bool(cfg.get("show_boxes_only", SHOW_BOXES_ONLY))
 
 
 def check_gui_available():
@@ -781,6 +785,148 @@ def draw_segmentation(frame: np.ndarray, detections: list) -> np.ndarray:
     return frame_with_overlay
 
 
+def extract_boxes_grid(frame: np.ndarray, detections: list, max_boxes: int = 12, box_size: int = 320) -> np.ndarray:
+    """
+    Extract bounding boxes from frame and arrange them in a grid layout.
+    Shows only the cropped content of each detection box (with masks if available).
+    
+    Args:
+        frame: Original video frame
+        detections: List of detection dictionaries with bbox and mask info
+        max_boxes: Maximum number of boxes to display
+        box_size: Size of each box in the grid (width and height)
+    
+    Returns:
+        Grid image with cropped bounding boxes arranged in rows/columns
+    """
+    if not detections:
+        # Return a placeholder if no detections
+        placeholder = np.zeros((box_size, box_size, 3), dtype=np.uint8)
+        cv2.putText(placeholder, "No detections", (50, box_size // 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        return placeholder
+    
+    # Limit number of boxes
+    detections = detections[:max_boxes]
+    
+    # Calculate grid dimensions
+    num_boxes = len(detections)
+    cols = int(np.ceil(np.sqrt(num_boxes)))
+    rows = int(np.ceil(num_boxes / cols))
+    
+    # Create grid canvas
+    grid_h = rows * box_size
+    grid_w = cols * box_size
+    grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+    
+    frame_h, frame_w = frame.shape[:2]
+    alpha = 0.5  # Mask overlay transparency
+    
+    for idx, det in enumerate(detections):
+        if not isinstance(det, dict):
+            continue
+            
+        bbox = det.get('bbox', {})
+        class_name = det.get('class_name', 'unknown')
+        confidence = det.get('confidence', 0.0)
+        class_id = det.get('class_id', 0)
+        mask = det.get('mask', None)
+        
+        # Get coordinates
+        x_min = int(bbox.get('x_min', 0))
+        y_min = int(bbox.get('y_min', 0))
+        x_max = int(bbox.get('x_max', 0))
+        y_max = int(bbox.get('y_max', 0))
+        
+        # Clamp to frame boundaries
+        x_min = max(0, min(x_min, frame_w))
+        y_min = max(0, min(y_min, frame_h))
+        x_max = max(0, min(x_max, frame_w))
+        y_max = max(0, min(y_max, frame_h))
+        
+        # Ensure valid box dimensions
+        if x_max <= x_min or y_max <= y_min:
+            continue
+        
+        # Extract box region from frame
+        box_region = frame[y_min:y_max, x_min:x_max].copy()
+        box_h, box_w = box_region.shape[:2]
+        
+        if box_h == 0 or box_w == 0:
+            continue
+        
+        # Apply mask if available
+        if mask is not None and isinstance(mask, np.ndarray):
+            mask_h, mask_w = mask.shape[:2]
+            bbox_h = y_max - y_min
+            bbox_w = x_max - x_min
+            
+            # Resize mask to match box region
+            if mask_h != bbox_h or mask_w != bbox_w:
+                mask_resized = cv2.resize(mask, (bbox_w, bbox_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                mask_resized = mask
+            
+            # Ensure mask is binary (0 or 255)
+            if mask_resized.dtype != np.uint8:
+                mask_resized = (mask_resized > 0.5).astype(np.uint8) * 255
+            
+            # Apply mask overlay
+            color = MASK_COLORS[class_id % len(MASK_COLORS)]
+            mask_colored = np.zeros_like(box_region)
+            mask_colored[mask_resized > 0] = color
+            
+            # Blend mask with box region
+            box_region = cv2.addWeighted(box_region, 1.0 - alpha, mask_colored, alpha, 0)
+        
+        # Resize box to fit grid cell (maintain aspect ratio)
+        scale = min(box_size / box_w, box_size / box_h)
+        new_w = int(box_w * scale)
+        new_h = int(box_h * scale)
+        
+        if new_w > 0 and new_h > 0:
+            resized_box = cv2.resize(box_region, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            
+            # Calculate position in grid
+            col = idx % cols
+            row = idx // cols
+            
+            # Center the resized box in the grid cell
+            y_offset = (box_size - new_h) // 2
+            x_offset = (box_size - new_w) // 2
+            
+            grid_y = row * box_size + y_offset
+            grid_x = col * box_size + x_offset
+            
+            # Place box in grid
+            grid[grid_y:grid_y + new_h, grid_x:grid_x + new_w] = resized_box
+            
+            # Draw border and label
+            color = MASK_COLORS[class_id % len(MASK_COLORS)]
+            cv2.rectangle(grid, 
+                         (col * box_size, row * box_size),
+                         ((col + 1) * box_size - 1, (row + 1) * box_size - 1),
+                         color, 2)
+            
+            # Draw label
+            label = f"{class_name}: {confidence:.2f}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_y = row * box_size + 20
+            
+            # Label background
+            cv2.rectangle(grid,
+                         (col * box_size, label_y - label_size[1] - 5),
+                         (col * box_size + label_size[0] + 5, label_y + 5),
+                         color, -1)
+            
+            # Label text
+            cv2.putText(grid, label,
+                       (col * box_size + 2, label_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    return grid
+
+
 # HTML template for web interface
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -930,50 +1076,58 @@ def video_capture_loop(picam2, cap, detector: HailoYOLO8Segmentation, enable_gui
                     and det.get("class_name", "").lower() in allowed_classes_set
                 ]
             
-            # Early downscaling for display operations (reduces mask overlay work significantly)
-            # Keep full resolution for inference, but work on smaller frame for display
-            if DISPLAY_SCALE < 1.0:
-                orig_h, orig_w = frame.shape[:2]
-                display_w = int(orig_w * DISPLAY_SCALE)
-                display_h = int(orig_h * DISPLAY_SCALE)
-                frame_display = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_AREA)
-                
-                # Scale detections to display dimensions (minimal Python work)
-                detections_scaled = []
-                for det in detections:
-                    det_scaled = det.copy()
-                    bbox = det_scaled['bbox']
-                    det_scaled['bbox'] = {
-                        'x_min': bbox['x_min'] * DISPLAY_SCALE,
-                        'y_min': bbox['y_min'] * DISPLAY_SCALE,
-                        'x_max': bbox['x_max'] * DISPLAY_SCALE,
-                        'y_max': bbox['y_max'] * DISPLAY_SCALE,
-                        'width': bbox['width'] * DISPLAY_SCALE,
-                        'height': bbox['height'] * DISPLAY_SCALE
-                    }
-                    # Scale mask if present (only resize the bbox-sized mask, not full frame)
-                    if det_scaled.get('mask') is not None:
-                        mask = det_scaled['mask']
-                        if mask is not None and mask.size > 0:
-                            mask_h, mask_w = mask.shape[:2]
-                            new_mask_w = int(mask_w * DISPLAY_SCALE)
-                            new_mask_h = int(mask_h * DISPLAY_SCALE)
-                            if new_mask_w > 0 and new_mask_h > 0:
-                                det_scaled['mask'] = cv2.resize(mask, (new_mask_w, new_mask_h), interpolation=cv2.INTER_LINEAR)
-                    detections_scaled.append(det_scaled)
-                
-                # Draw on downscaled frame (much faster - 4x fewer pixels for mask overlay with 0.5 scale)
-                frame_with_overlay = draw_segmentation(frame_display, detections_scaled)
+            # Draw detections or show boxes only
+            if SHOW_BOXES_ONLY:
+                # Extract boxes from original frame (use full resolution for better quality)
+                frame_with_overlay = extract_boxes_grid(frame, detections, max_boxes=12, box_size=320)
             else:
-                # No downscaling, use full resolution
-                frame_with_overlay = draw_segmentation(frame, detections)
+                # Early downscaling for display operations (reduces mask overlay work significantly)
+                # Keep full resolution for inference, but work on smaller frame for display
+                if DISPLAY_SCALE < 1.0:
+                    orig_h, orig_w = frame.shape[:2]
+                    display_w = int(orig_w * DISPLAY_SCALE)
+                    display_h = int(orig_h * DISPLAY_SCALE)
+                    frame_display = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_AREA)
+                    
+                    # Scale detections to display dimensions (minimal Python work)
+                    detections_scaled = []
+                    for det in detections:
+                        det_scaled = det.copy()
+                        bbox = det_scaled['bbox']
+                        det_scaled['bbox'] = {
+                            'x_min': bbox['x_min'] * DISPLAY_SCALE,
+                            'y_min': bbox['y_min'] * DISPLAY_SCALE,
+                            'x_max': bbox['x_max'] * DISPLAY_SCALE,
+                            'y_max': bbox['y_max'] * DISPLAY_SCALE,
+                            'width': bbox['width'] * DISPLAY_SCALE,
+                            'height': bbox['height'] * DISPLAY_SCALE
+                        }
+                        # Scale mask if present (only resize the bbox-sized mask, not full frame)
+                        if det_scaled.get('mask') is not None:
+                            mask = det_scaled['mask']
+                            if mask is not None and mask.size > 0:
+                                mask_h, mask_w = mask.shape[:2]
+                                new_mask_w = int(mask_w * DISPLAY_SCALE)
+                                new_mask_h = int(mask_h * DISPLAY_SCALE)
+                                if new_mask_w > 0 and new_mask_h > 0:
+                                    det_scaled['mask'] = cv2.resize(mask, (new_mask_w, new_mask_h), interpolation=cv2.INTER_LINEAR)
+                        detections_scaled.append(det_scaled)
+                    
+                    # Draw on downscaled frame (much faster - 4x fewer pixels for mask overlay with 0.5 scale)
+                    frame_with_overlay = draw_segmentation(frame_display, detections_scaled)
+                else:
+                    # No downscaling, use full resolution
+                    frame_with_overlay = draw_segmentation(frame, detections)
             
             # Log resolutions once
             if not resolution_logged:
                 cam_h, cam_w = frame.shape[:2]
                 out_h, out_w = frame_with_overlay.shape[:2]
-                match = (cam_h == out_h) and (cam_w == out_w)
-                print(f"Camera input: {cam_w}x{cam_h}, output: {out_w}x{out_h} (match: {match})")
+                if SHOW_BOXES_ONLY:
+                    print(f"Camera input: {cam_w}x{cam_h}, output: {out_w}x{out_h} (box-only mode)")
+                else:
+                    match = (cam_h == out_h) and (cam_w == out_w)
+                    print(f"Camera input: {cam_w}x{cam_h}, output: {out_w}x{out_h} (match: {match})")
                 resolution_logged = True
             
             # Calculate FPS
@@ -1055,6 +1209,7 @@ def main():
     print(f"Web preview: {'Enabled' if ENABLE_WEB else 'Disabled'}")
     print(f"GUI preview: {'Enabled' if ENABLE_GUI else 'Disabled'}")
     print(f"Display preview (Whisplay): {'Enabled' if ENABLE_WHISPLAY else 'Disabled'}")
+    print(f"Box-only preview: {'Enabled' if SHOW_BOXES_ONLY else 'Disabled'}")
     if allowed_classes_set is None:
         print("Detection classes: all")
     else:
